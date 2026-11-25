@@ -1,0 +1,63 @@
+name: TrustDrift monitor
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: trustdrift-monitor
+  cancel-in-progress: false
+
+jobs:
+  poll:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Get the code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Get the data branch (create it on the first run)
+        run: |
+          git config --global user.name "trustdrift-bot"
+          git config --global user.email "trustdrift-bot@users.noreply.github.com"
+          REPO_URL="https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git"
+          if git ls-remote --exit-code --heads "$REPO_URL" monitor-data > /dev/null 2>&1; then
+            git clone --quiet --depth 1 --branch monitor-data "$REPO_URL" data
+          else
+            mkdir data
+            cd data
+            git init --quiet -b monitor-data
+            git remote add origin "$REPO_URL"
+          fi
+
+      - name: Poll npm and score new releases
+        run: python trustdrift_cloud_monitor.py --data-dir data --watch watchlist.txt --workers 8 --snapshots --alerts-file data/alerts_new.md
+
+      - name: Open an issue if anything was flagged
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ -s data/alerts_new.md ]; then
+            gh issue create --title "Automated review request $(date -u +%Y-%m-%dT%H:%MZ)" --body-file data/alerts_new.md
+            cat data/alerts_new.md >> data/alerts_history.md
+          fi
+          rm -f data/alerts_new.md
+
+      - name: Save the data
+        run: |
+          cd data
+          git add -A
+          if ! git diff --cached --quiet; then
+            git commit --quiet -m "monitor data $(date -u +%Y-%m-%dT%H:%MZ)"
+            git push --quiet origin HEAD:monitor-data
+          fi
