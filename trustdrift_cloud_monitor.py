@@ -26,7 +26,10 @@ def fetch_tags(name, tries=3):
         except urllib.error.HTTPError as e:
             if e.code == 404: return None
             last = f"HTTP {e.code}"
-            if e.code == 429: time.sleep(10 * (k + 1)); continue
+            if e.code == 429:
+                try: wait = min(60, int(e.headers.get("Retry-After", 10 * (k + 1))))
+                except Exception: wait = 10 * (k + 1)
+                time.sleep(wait); continue
         except Exception as e: last = type(e).__name__
         time.sleep(2 * (k + 1))
     raise RuntimeError(last)
@@ -59,6 +62,24 @@ def append_csv(path, header, row):
         w = csv.writer(f)
         if new: w.writerow(header)
         w.writerow(row)
+def check_chunked(names, workers, budget_s, t_start):
+    """Ask npm for dist-tags in chunks of 250, printing progress, backing off when many requests fail, and stopping when the time budget is used.
+    Returns (tags found, error counts, number of names processed)."""
+    res, errs = {}, collections.Counter(); i = 0; w = workers
+    def one(p):
+        try: return p, fetch_tags(p), None
+        except Exception as e: return p, None, str(e)
+    while i < len(names):
+        if time.time() - t_start > budget_s: print(f"  time budget used after {i} of {len(names)} packages; the rest are checked next round", flush=True); break
+        chunk = names[i:i + 250]; bad = 0
+        with cf.ThreadPoolExecutor(max_workers=w) as ex:
+            for p, t, err in ex.map(one, chunk):
+                if err: errs[err] += 1; bad += 1
+                elif t is not None: res[p] = t
+        i += len(chunk)
+        print(f"  checked {i}/{len(names)} packages, {sum(errs.values())} errors so far, {time.time() - t_start:.0f} s elapsed, {w} workers", flush=True)
+        if bad > len(chunk) * 0.2: w = max(2, w // 2); print(f"  many requests failed; slowing down to {w} workers", flush=True); time.sleep(15)
+    return res, errs, i
 def run_round(a):
     D = a.data_dir; os.makedirs(os.path.join(D, "snapshots"), exist_ok=True)
     names = [l.strip() for l in open(a.watch, encoding="utf-8") if l.strip()]
@@ -66,17 +87,13 @@ def run_round(a):
     t0 = now(); hb = os.path.join(D, "heartbeat.json")
     prev = json.load(open(hb))["last_round_utc"] if os.path.exists(hb) else None
     gap = (t0 - parse(prev)).total_seconds() / 60 if prev else None
-    tags, errs = {}, collections.Counter()
-    def one(p):
-        try: return p, fetch_tags(p), None
-        except Exception as e: return p, None, str(e)
-    with cf.ThreadPoolExecutor(max_workers=a.workers) as ex:
-        for p, t, err in ex.map(one, names):
-            if err: errs[err] += 1
-            elif t is not None: tags[p] = t
+    cursor = json.load(open(hb)).get("cursor", 0) if os.path.exists(hb) else 0
+    cursor %= max(1, len(names)); order = names[cursor:] + names[:cursor]; ts = time.time()
+    tags, errs, done_n = check_chunked(order, a.workers, a.max_minutes * 60, ts)
     first = scored = 0; alerts = []
-    for p in names:
+    for p in order:
         if p not in tags: continue
+        if time.time() - ts > (a.max_minutes + 6) * 60: print("scoring time budget used; remaining changed packages are retried next round", flush=True); break
         h = tags_hash(tags[p])
         if p not in st: st[p] = (h, iso(t0 - timedelta(minutes=2))); first += 1; continue
         if st[p][0] == h: continue
@@ -97,15 +114,15 @@ def run_round(a):
                 alerts.append(f"### {r['tier']}: [{p}@{v}](https://www.npmjs.com/package/{p}/v/{v})\n- published {iso(pub)}, detected {iso(det)} (lag {lag:.0f} min)\n- path score {r['path_score']}, content score {r['content_score']}; signals: {', '.join(sig) or 'none'}; publisher: {r.get('publisher')}\n- A flag is a prompt to look, not proof of an attack. Review the release on npm and record the outcome in the incident log.\n")
         st[p] = (h, iso(newest))
     write_tags(os.path.join(D, "tags.tsv"), st)
-    json.dump({"last_round_utc": iso(t0)}, open(hb, "w"))
+    json.dump({"last_round_utc": iso(t0), "cursor": (cursor + done_n) % max(1, len(names))}, open(hb, "w"))
     append_csv(os.path.join(D, "live_rounds.csv"), ["round_start_utc", "gap_since_previous_round_min", "packages", "unreachable", "new_scored", "first_seen"], [iso(t0), "" if gap is None else round(gap, 1), len(names), sum(errs.values()), scored, first])
     af = a.alerts_file
     if alerts and af: open(af, "w", encoding="utf-8").write("# TrustDrift alert(s)\n\n" + "\n".join(alerts))
-    msg = f"{iso(now())} round done: {len(names)} packages checked, {scored} new release(s) scored, {first} recorded for the first time, {len(alerts)} alert(s)"
+    msg = f"{iso(now())} round done: {done_n} of {len(names)} packages checked, {scored} new release(s) scored, {first} recorded for the first time, {len(alerts)} alert(s)"
     if errs: msg += f"; unreachable {sum(errs.values())} ({', '.join(f'{k} x{v}' for k, v in errs.items())})"
     print(msg, flush=True)
 if __name__ == "__main__":
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--data-dir", default="data"); ap.add_argument("--watch", default="watchlist.txt"); ap.add_argument("--workers", type=int, default=8)
-    ap.add_argument("--snapshots", action="store_true", help="also keep our own archive of each new release's manifest"); ap.add_argument("--alerts-file", default=""); ap.add_argument("--scorer", default="collector_v4")
+    ap.add_argument("--snapshots", action="store_true", help="also keep our own archive of each new release's manifest"); ap.add_argument("--alerts-file", default=""); ap.add_argument("--scorer", default="collector_v4"); ap.add_argument("--max-minutes", type=float, default=20, help="time budget for checking packages in one round")
     run_round(ap.parse_args())
